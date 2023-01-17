@@ -86,11 +86,17 @@
 /* Demo task configurations include. */
 #include "temp_sub_pub_and_led_control_demo_config.h"
 
+/* SHADOW API header. */
+#include "shadow.h"
+
 /* Preprocessor definitions ***************************************************/
 
 /* coreMQTT-Agent event group bit definitions */
 #define CORE_MQTT_AGENT_CONNECTED_BIT              ( 1 << 0 )
 #define CORE_MQTT_AGENT_OTA_NOT_IN_PROGRESS_BIT    ( 1 << 1 )
+
+/* The maximum queue size for publish tasks. */
+#define MAX_QUEUE_SIZE 5
 
 /* Struct definitions *********************************************************/
 
@@ -106,6 +112,12 @@ struct MQTTAgentCommandContext
     void * pArgs;
 };
 
+typedef enum
+{
+    TEMPERATURE = 0,
+	LED = 1
+} update_t;
+
 /* Global variables ***********************************************************/
 
 /**
@@ -120,17 +132,51 @@ const static char * TAG = "temp_sub_pub_and_led_control_demo";
 extern MQTTAgentContext_t xGlobalMqttAgentContext;
 
 /**
+ * @brief The buffer to hold the publish topic filter. 
+ * The topic is generated at runtime by adding the thing shadow names.
+ *
+ * @note The topic strings must persist until unsubscribed.
+ */
+static char pubTopicBuf[ temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH ];
+
+/**
  * @brief The buffer to hold the topic filter. The topic is generated at runtime
  * by adding the task names.
  *
  * @note The topic strings must persist until unsubscribed.
  */
-static char topicBuf[ temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH ];
+static char subTopicBuf[ temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH ];
 
 /**
  * @brief The event group used to manage coreMQTT-Agent events.
  */
 static EventGroupHandle_t xNetworkEventGroup;
+
+/**
+ * @brief The semaphore used to lock access to ulMessageID to eliminate a race
+ * condition in which multiple tasks try to increment/get ulMessageID.
+ */
+static SemaphoreHandle_t xMessageIdSemaphore;
+
+/**
+ * @brief The message ID for the next message sent by this demo.
+ */
+static uint32_t ulMessageId = 0;
+
+/**
+ * @brief The buffer to hold the publish payload for temperature data.
+ */
+float temperatureValue;
+
+/**
+ * @brief The buffer to hold the state of the LED control data.
+ */
+uint32_t state = 0;
+
+/**
+ * @brief The queue to notify the publish message type and publish is needed to be sent.
+ */
+QueueHandle_t xQueue;
 
 /* Static function declarations ***********************************************/
 
@@ -206,6 +252,19 @@ static BaseType_t prvWaitForCommandAcknowledgment( uint32_t * pulNotifiedValue )
  */
 static void prvIncomingPublishCallback( void * pvIncomingPublishCallbackContext,
                                         MQTTPublishInfo_t * pxPublishInfo );
+
+/**
+ * @brief Publish to the topic the demo task will also publish to - that
+ * results in all outgoing publishes being published back to the task
+ * (effectively echoed back).
+ *
+ * @param[in] xQoS The quality of service (QoS) to use.  Can be zero or one
+ * for all MQTT brokers.  Can also be QoS2 if supported by the broker.  AWS IoT
+ * does not support QoS2.
+ */
+static void prvPublishToTopic( MQTTQoS_t xQoS,
+                               char * pcTopicName,
+                               char * pcPayload );
 
 /**
  * @brief Subscribe to the topic the demo task will also publish to - that
@@ -294,51 +353,99 @@ static BaseType_t prvWaitForCommandAcknowledgment( uint32_t * pulNotifiedValue )
                                portMAX_DELAY );
     return xReturn;
 }
-
-static void prvParseIncomingPublish( char * publishPayload,
-                                     size_t publishPayloadLength )
+static void prvParseIncomingPublish( MQTTPublishInfo_t * pMqttPublishInfo )
 {
     char * outValue = NULL;
     uint32_t outValueLength = 0U;
     JSONStatus_t result = JSONSuccess;
-    uint32_t state = 0;
+	ShadowStatus_t shadowStatus = SHADOW_FAIL;
+	ShadowMessageType_t messageType = ShadowMessageTypeMaxNum;
+	bool stateChanged = false;
+	
+	shadowStatus = Shadow_MatchTopicString(	pMqttPublishInfo->pTopicName,
+											pMqttPublishInfo->topicNameLength,
+											&messageType,
+											NULL,
+											NULL,
+											NULL,
+											NULL );
 
-    result = JSON_Validate( ( const char * ) publishPayload,
-                            publishPayloadLength );
+	if( shadowStatus == SHADOW_SUCCESS )
+	{
+		if( messageType == ShadowMessageTypeUpdateDelta )
+		{
+			ESP_LOGI( TAG, "Received a delta message: \"%.*s\"", pMqttPublishInfo->payloadLength, pMqttPublishInfo->pPayload );
 
-    if( result == JSONSuccess )
-    {
-        result = JSON_Search( ( char * ) publishPayload,
-                              publishPayloadLength,
-                              "led.power",
-                              sizeof( "led.power" ) - 1,
-                              &outValue,
-                              ( size_t * ) &outValueLength );
-    }
-    else
-    {
-        ESP_LOGE( TAG, "The JSON document is invalid!" );
-        return;
-    }
+			/* Check if JSON is valid. */
+			result = JSON_Validate( ( const char * ) pMqttPublishInfo->pPayload,
+									pMqttPublishInfo->payloadLength );
 
-    if( result == JSONSuccess )
-    {
-        /* Convert the extracted value to an unsigned integer value. */
-        state = ( uint32_t ) strtoul( outValue, NULL, 10 );
+			/* Update device LED based on delta request. */
+			if( result == JSONSuccess )
+			{
+				result = JSON_Search( ( char * ) pMqttPublishInfo->pPayload,
+									  pMqttPublishInfo->payloadLength,
+									  "state.led.power",
+									  sizeof( "state.led.power" ) - 1,
+									  &outValue,
+									  ( size_t * ) &outValueLength );
+			}
+			else
+			{
+				ESP_LOGE( TAG, "Invalid JSON." );
+			}
 
-        if( state == 1 )
-        {
-            ws2812_led_set_rgb( 0, 25, 0 );
-        }
-        else if( state == 0 )
-        {
-            ws2812_led_clear();
-        }
-    }
-    else
-    {
-        /* JSON is valid, but the publish is not related to LED. */
-    }
+			if ( result == JSONSuccess )
+			{
+				/* Convert the extracted value to an unsigned integer value. */
+				state = ( uint32_t ) strtoul( outValue, NULL, 10 );
+
+				if( state == 1 )
+				{
+					ESP_LOGI( TAG, "Turning on LED." );
+					ws2812_led_set_rgb( 0, 25, 0 );
+					stateChanged = true;
+				}
+				else if( state == 0 )
+				{
+					ESP_LOGI( TAG, "Turning off LED." );
+					ws2812_led_clear();
+					stateChanged = true;
+				}
+			}
+			else
+			{
+				/* JSON is valid, but the publish is not related to LED. */
+				ESP_LOGE( TAG, "No power key in JSON object." );
+			}
+
+			/* Update the device shadow if the state changed. */
+			if( stateChanged == true )
+			{
+				ESP_LOGI( TAG, "Sending update to device shadow." );
+
+				update_t updateType = LED;
+				xQueueSend( xQueue, &updateType, 0 );
+			}
+			
+		}
+		else if( messageType == ShadowMessageTypeUpdateAccepted )
+		{
+			ESP_LOGI( TAG, "Received an update accepted message." );
+		}
+		else if( messageType == ShadowMessageTypeUpdateDocuments )
+		{
+			ESP_LOGI( TAG, "Received an update documents message." );
+		}
+		else if( messageType == ShadowMessageTypeUpdateRejected )
+		{
+			ESP_LOGI( TAG, "Received an update rejected message." );
+		}
+		else
+		{
+			ESP_LOGE( TAG, "Received an unknown message." );
+		}
+	}
 }
 
 static void prvIncomingPublishCallback( void * pvIncomingPublishCallbackContext,
@@ -365,7 +472,134 @@ static void prvIncomingPublishCallback( void * pvIncomingPublishCallbackContext,
               "Received incoming publish message %s",
               cTerminatedString );
 
-    prvParseIncomingPublish( ( char * ) pxPublishInfo->pPayload, pxPublishInfo->payloadLength );
+    // prvParseIncomingPublish( ( char * ) pxPublishInfo->pPayload, pxPublishInfo->payloadLength );
+	prvParseIncomingPublish( pxPublishInfo );
+}
+
+static void prvPublishToTopic( MQTTQoS_t xQoS,
+                               char * pcTopicName,
+                               char * pcPayload )
+{
+	uint32_t ulPublishMessageId = 0;
+
+    MQTTStatus_t xCommandAdded;
+    BaseType_t xCommandAcknowledged = pdFALSE;
+
+    MQTTPublishInfo_t xPublishInfo = { 0 };
+
+    MQTTAgentCommandContext_t xCommandContext = { 0 };
+    MQTTAgentCommandInfo_t xCommandParams = { 0 };
+
+	uint32_t ulNotification = 0U, ulValueToNotify = 0UL;
+
+	/* Create a unique number of the publish that is about to be sent.  The number
+     * is used as the command context and is sent back to this task as a notification
+     * in the callback that executed upon receipt of the subscription acknowledgment.
+     * That way this task can match an acknowledgment to a subscription. */
+    xTaskNotifyStateClear( NULL );
+
+	/* Create a unique number for the publish that is about to be sent.
+     * This number is used in the command context and is sent back to this task
+     * as a notification in the callback that's executed upon receipt of the
+     * publish from coreMQTT-Agent.
+     * That way this task can match an acknowledgment to the message being sent.
+     */
+    xSemaphoreTake( xMessageIdSemaphore, portMAX_DELAY );
+    {
+        ++ulMessageId;
+        ulPublishMessageId = ulMessageId;
+    }
+    xSemaphoreGive( xMessageIdSemaphore );
+
+    /* Configure the publish operation. The topic name string must persist for
+     * duration of publish! */
+    xPublishInfo.qos = xQoS;
+    xPublishInfo.pTopicName = pcTopicName;
+    xPublishInfo.topicNameLength = ( uint16_t ) strlen( pcTopicName );
+    xPublishInfo.pPayload = pcPayload;
+    xPublishInfo.payloadLength = ( uint16_t ) strlen( pcPayload );
+
+    /* Complete an application defined context associated with this publish
+     * message.
+     * This gets updated in the callback function so the variable must persist
+     * until the callback executes. */
+    xCommandContext.ulNotificationValue = ulPublishMessageId;
+    xCommandContext.xTaskToNotify = xTaskGetCurrentTaskHandle();
+
+    xCommandParams.blockTimeMs = temppubsubandledcontrolconfigMAX_COMMAND_SEND_BLOCK_TIME_MS;
+    xCommandParams.cmdCompleteCallback = prvPublishCommandCallback;
+    xCommandParams.pCmdCompleteCallbackContext = &xCommandContext;
+
+    do
+    {
+        /* Wait for coreMQTT-Agent task to have working network connection and
+         * not be performing an OTA update. */
+        xEventGroupWaitBits( xNetworkEventGroup,
+                             CORE_MQTT_AGENT_CONNECTED_BIT | CORE_MQTT_AGENT_OTA_NOT_IN_PROGRESS_BIT,
+                             pdFALSE,
+                             pdTRUE,
+                             portMAX_DELAY );
+
+        ESP_LOGI( TAG,
+                  "Task \"%s\" sending publish request to coreMQTT-Agent with message \"%s\" on topic \"%s\".",
+                  pcTaskGetName( xCommandContext.xTaskToNotify ),
+                  pcPayload,
+                  pcTopicName );
+
+		/* To ensure ulNotification doesn't accidentally hold the expected value
+         * as it is to be checked against the value sent from the callback.. */
+        ulNotification = ~ulValueToNotify;
+
+        xCommandAcknowledged = pdFALSE;
+
+        xCommandAdded = MQTTAgent_Publish( &xGlobalMqttAgentContext,
+                                           &xPublishInfo,
+                                           &xCommandParams );
+
+        if( xCommandAdded == MQTTSuccess )
+        {
+            /* For QoS 1 and 2, wait for the publish acknowledgment.  For QoS0,
+             * wait for the publish to be sent. */
+            ESP_LOGI( TAG,
+                      "Task \"%s\" waiting for publish %d to complete.",
+                      pcTaskGetName( xCommandContext.xTaskToNotify ),
+                      ulPublishMessageId );
+
+            xCommandAcknowledged = prvWaitForCommandAcknowledgment( &ulNotification );
+        }
+        else
+        {
+            ESP_LOGE( TAG,
+                      "Failed to enqueue publish command. Error code=%s",
+                      MQTT_Status_strerror( xCommandAdded ) );
+        }
+
+        /* Check all ways the status was passed back just for demonstration
+         * purposes. */
+		// @warning ulNotifiedValue is not the same as ulPublishMessageId, bypassing it first
+		ESP_LOGW( TAG, "xCommandAcknowledged=%s, xCommandContext.xReturnStatus=%s, ulNotifiedValue=%d, ulPublishMessageId=%d", (xCommandAcknowledged==pdTRUE) ? "pdTRUE" : "pdFALSE", (xCommandContext.xReturnStatus==MQTTSuccess) ? "MQTTSuccess" : "MQTTFail", ulNotification, ulValueToNotify);
+        // if( ( xCommandAcknowledged != pdTRUE ) ||
+        //     ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
+        //     ( ulNotification != ulValueToNotify ) )
+		if( ( xCommandAcknowledged != pdTRUE ) ||
+            ( xCommandContext.xReturnStatus != MQTTSuccess )  )
+        {
+            ESP_LOGW( TAG,
+                      "Error or timed out waiting for ack for publish message %ld. Re-attempting publish.",
+                      ulValueToNotify );
+        }
+        else
+        {
+            ESP_LOGI( TAG,
+                      "Publish %ld succeeded for task \"%s\".",
+                      ulValueToNotify,
+                      pcTaskGetName( xCommandContext.xTaskToNotify ) );
+        }
+    // } while( ( xCommandAcknowledged != pdTRUE ) ||
+    //          ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
+    //          ( ulNotification != ulValueToNotify ) );
+	} while( ( xCommandAcknowledged != pdTRUE ) ||
+             ( xCommandContext.xReturnStatus != MQTTSuccess ) );
 }
 
 static bool prvSubscribeToTopic( MQTTQoS_t xQoS,
@@ -455,10 +689,9 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
     uint32_t ulNotification = 0U, ulValueToNotify = 0UL;
     MQTTStatus_t xCommandAdded;
     MQTTQoS_t xQoS;
-    TickType_t xTicksToDelay;
-    float temperatureValue;
     MQTTAgentCommandInfo_t xCommandParams = { 0UL };
-    char * pcTopicBuffer = topicBuf;
+    char * pcSubTopicBuffer = subTopicBuf;
+	char * pcPubTopicBuffer = pubTopicBuf;
     const char * pcTaskName;
     uint32_t ulPublishPassCounts = 0;
     uint32_t ulPublishFailCounts = 0;
@@ -467,6 +700,8 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
 
     /* Hardware initialisation */
     app_driver_init();
+
+	xMessageIdSemaphore = xSemaphoreCreateMutex();
 
     /* Initialize the coreMQTT-Agent event group. */
     xNetworkEventGroup = xEventGroupCreate();
@@ -478,23 +713,40 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
 
     xQoS = ( MQTTQoS_t ) temppubsubandledcontrolconfigQOS_LEVEL;
 
-    /* Create a topic name for this task to publish to. */
-    snprintf( pcTopicBuffer,
-              temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH,
-              "/filter/%s",
-              pcTaskName );
+    /* Create a topic name for this task to subscribe to. */
+	uint16_t outLength = 0;
+	Shadow_AssembleTopicString(	ShadowTopicStringTypeUpdateDelta,
+								CONFIG_GRI_THING_NAME,
+								sizeof( CONFIG_GRI_THING_NAME ) - 1,
+								"",	// for classic shadow
+								0,  // for classic shadow
+								pcSubTopicBuffer,
+								temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH,
+								&outLength );
+	pcSubTopicBuffer[outLength] = '\0'; // null terminate the string for correct strlen
 
     /* Subscribe to the same topic to which this task will publish.  That will
      * result in each published message being published from the server back to
      * the target. */
-    prvSubscribeToTopic( xQoS, pcTopicBuffer );
+    prvSubscribeToTopic( xQoS, pcSubTopicBuffer );
 
     /* Configure the publish operation. */
     memset( ( void * ) &xPublishInfo, 0x00, sizeof( xPublishInfo ) );
     xPublishInfo.qos = xQoS;
-    xPublishInfo.pTopicName = pcTopicBuffer;
-    xPublishInfo.topicNameLength = ( uint16_t ) strlen( pcTopicBuffer );
+    xPublishInfo.pTopicName = pcPubTopicBuffer;
     xPublishInfo.pPayload = payloadBuf;
+
+	/* Create a topic name for this task to publish to. */
+	Shadow_AssembleTopicString(	ShadowTopicStringTypeUpdate,
+							CONFIG_GRI_THING_NAME,
+							sizeof( CONFIG_GRI_THING_NAME ) - 1,
+							"",	// for classic shadow
+							0,  // for classic shadow
+							pcPubTopicBuffer,
+							temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH,
+							&outLength );
+	pcPubTopicBuffer[outLength] = '\0'; // null terminate the string for correct strlen
+	xPublishInfo.topicNameLength = ( uint16_t ) outLength;
 
     /* Store the handler to this task in the command context so the callback
      * that executes when the command is acknowledged can send a notification
@@ -508,30 +760,67 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
 
     ulValueToNotify = 0UL;
 
+	/* Update initial report status. */
+	state = 1;
+	update_t updateType = LED;
+	xQueueSend( xQueue, &updateType, 0 );
+
     /* For an infinite number of publishes */
     while( 1 )
     {
-        /* Create a payload to send with the publish message.  This contains
-         * the task name, temperature and the iteration number. */
 
-        temperatureValue = app_driver_temp_sensor_read_celsius();
+		/* Wait for incoming publish request. */
+		if ( xQueueReceive( xQueue, &updateType, portMAX_DELAY ) == pdPASS )
+		{
+			/* Put LED as first priority in if/else statement to minimize INSTANT SYNC response time. */
+			if ( updateType == LED )
+			{
+				/* Create a payload for INSTANT SYNC response. */
+				snprintf( 	payloadBuf,
+							temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH,
+							"{"                          \
+							"\"state\":{"                \
+							"\"reported\":{"             \
+							"\"led\":"                   \
+							"{"                          \
+							" \"power\": %d"             \
+							"}"                          \
+							"}"                          \
+							"}"                          \
+							"}"                          \
+							,
+							state ); 
+			}
+			else if ( updateType == TEMPERATURE )
+			{
+				/* Create a payload to send with the publish message.  This contains
+				* the task name, temperature and the iteration number. */
+				snprintf( payloadBuf,
+						temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH,
+						"{"                          \
+						"\"state\":{"                \
+						"\"reported\":{"             \
+						"\"temperatureSensor\":"     \
+						"{"                          \
+						" \"taskName\": \"%s\","     \
+						" \"temperatureValue\": %f," \
+						" \"iteration\": %d"         \
+						"}"                          \
+						"}"                          \
+						"}"                          \
+						"}"                          \
+						,
+						pcTaskName,
+						temperatureValue,
+						( int ) ulValueToNotify );
+			}
+		}
 
-        snprintf( payloadBuf,
-                  temppubsubandledcontrolconfigSTRING_BUFFER_LENGTH,
-                  "{"                          \
-                  "\"temperatureSensor\":"     \
-                  "{"                          \
-                  " \"taskName\": \"%s\","     \
-                  " \"temperatureValue\": %f," \
-                  " \"iteration\": %d"         \
-                  "}"                          \
-                  "}"                          \
-                  ,
-                  pcTaskName,
-                  temperatureValue,
-                  ( int ) ulValueToNotify );
+		
 
+		// prvPublishToTopic( xQoS, pcPubTopicBuffer, payloadBuf );
         xPublishInfo.payloadLength = ( uint16_t ) strlen( payloadBuf );
+
 
         /* Also store the incrementing number in the command context so it can
          * be accessed by the callback that executes when the publish operation
@@ -549,7 +838,7 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
         ESP_LOGI( TAG,
                   "Sending publish request to agent with message \"%s\" on topic \"%s\"",
                   payloadBuf,
-                  pcTopicBuffer );
+                  pcPubTopicBuffer );
 
         /* To ensure ulNotification doesn't accidentally hold the expected value
          * as it is to be checked against the value sent from the callback.. */
@@ -578,7 +867,7 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
             ESP_LOGI( TAG,
                       "Rx'ed %s from Tx to %s (P%d:F%d).",
                       ( xQoS == 0 ) ? "completion notification for QoS0 publish" : "ack for QoS1 publish",
-                      pcTopicBuffer,
+                      pcPubTopicBuffer,
                       ulPublishPassCounts,
                       ulPublishFailCounts );
         }
@@ -588,22 +877,35 @@ static void prvTempSubPubAndLEDControlTask( void * pvParameters )
             ESP_LOGE( TAG,
                       "Timed out Rx'ing %s from Tx to %s (P%d:F%d)",
                       ( xQoS == 0 ) ? "completion notification for QoS0 publish" : "ack for QoS1 publish",
-                      pcTopicBuffer,
+                      pcPubTopicBuffer,
                       ulPublishPassCounts,
                       ulPublishFailCounts );
         }
 
         ulValueToNotify++;
-
-        /* Add a little randomness into the delay so the tasks don't remain
-         * in lockstep. */
-        xTicksToDelay = pdMS_TO_TICKS( temppubsubandledcontrolconfigDELAY_BETWEEN_PUBLISH_OPERATIONS_MS ) +
-                        ( rand() % 0xff );
-
-        vTaskDelay( xTicksToDelay );
     }
 
     vTaskDelete( NULL );
+}
+
+static void prvTempUpdateTask( void * pvParameters )
+{
+	while (1)
+	{
+		temperatureValue = app_driver_temp_sensor_read_celsius();
+
+		update_t updateType = TEMPERATURE;
+		xQueueSend( xQueue, &updateType, 0 );
+
+		/* Add a little randomness into the delay so the tasks don't remain
+         * in lockstep. */
+        TickType_t xTicksToDelay = 	pdMS_TO_TICKS( temppubsubandledcontrolconfigDELAY_BETWEEN_PUBLISH_OPERATIONS_MS ) +
+                        			( rand() % 0xff );
+
+        vTaskDelay( xTicksToDelay );
+	}
+	
+
 }
 
 static void prvCoreMqttAgentEventHandler( void * pvHandlerArg,
@@ -660,10 +962,19 @@ static void prvCoreMqttAgentEventHandler( void * pvHandlerArg,
 
 void vStartTempSubPubAndLEDControlDemo( void )
 {
+	xQueue = xQueueCreate( MAX_QUEUE_SIZE, sizeof( update_t ) );
+
     xTaskCreate( prvTempSubPubAndLEDControlTask,
                  "TempSubPubLED",
                  temppubsubandledcontrolconfigTASK_STACK_SIZE,
                  NULL,
                  temppubsubandledcontrolconfigTASK_PRIORITY,
                  NULL );
+
+	xTaskCreate( prvTempUpdateTask,
+				 "TempUpdate",
+				 3072,
+				 NULL,
+				 5,
+				 NULL );
 }

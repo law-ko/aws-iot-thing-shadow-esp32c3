@@ -132,13 +132,6 @@ static BaseType_t prvInitializeNetworkContext( void )
     /* This is returned by this function. */
     BaseType_t xRet = pdPASS;
 
-    /* This is used to store the required buffer length when retrieving data
-     * from flash. */
-    uint32_t ulBufferLen;
-
-    /* This is used to store the error return of ESP-IDF functions. */
-    esp_err_t xEspErrRet = ESP_OK;
-
     /* Verify that the MQTT endpoint and thing name have been configured by the
      * user. */
     if( strlen( CONFIG_GRI_MQTT_ENDPOINT ) == 0 )
@@ -162,93 +155,28 @@ static BaseType_t prvInitializeNetworkContext( void )
     xNetworkContext.pcHostname = CONFIG_GRI_MQTT_ENDPOINT;
     xNetworkContext.xPort = CONFIG_GRI_MQTT_PORT;
 
-    // /* Get the device certificate from esp_secure_crt_mgr and put into network
-    //  * context. */
-    // xEspErrRet = esp_secure_cert_get_dev_cert_addr( ( const void ** ) &xNetworkContext.pcClientCertPem,
-    //                                                 &ulBufferLen );
-
 	/* Get the device certificate from ASM under main/certs folder. */
+	xNetworkContext.pcServerRootCAPem = root_cert_auth_pem_start;
 	xNetworkContext.pcClientCertPem = client_cert_pem_start;
 	xNetworkContext.pcClientKeyPem = client_key_pem_start;
 
-    if( xEspErrRet == ESP_OK )
-    {
-        #if CONFIG_GRI_OUTPUT_CERTS_KEYS
-            ESP_LOGI( TAG, "\nDevice Cert: \nLength: %d\n%s",
-                      strlen( xNetworkContext.pcClientCertPem ),
-                      xNetworkContext.pcClientCertPem );
-        #endif /* CONFIG_GRI_OUTPUT_CERTS_KEYS */
-    }
-    else
-    {
-        ESP_LOGE( TAG, "Error in getting device certificate. Error: %s",
-                  esp_err_to_name( xEspErrRet ) );
+	#if CONFIG_GRI_OUTPUT_CERTS_KEYS
+		ESP_LOGI( TAG, "\nDevice Cert: \nLength: %d\n%s",
+					strlen( xNetworkContext.pcClientCertPem ),
+					xNetworkContext.pcClientCertPem );
+	#endif /* CONFIG_GRI_OUTPUT_CERTS_KEYS */
 
-        xRet = pdFAIL;
-    }
+	#if CONFIG_GRI_OUTPUT_CERTS_KEYS
+		ESP_LOGI( TAG, "\nCA Cert: \nLength: %d\n%s",
+					strlen( xNetworkContext.pcServerRootCAPem ),
+					xNetworkContext.pcServerRootCAPem );
+	#endif /* CONFIG_GRI_OUTPUT_CERTS_KEYS */
 
-    /* Get the root CA certificate from esp_secure_crt_mgr and put into network
-     * context. */
-    xEspErrRet = esp_secure_cert_get_ca_cert_addr( ( const void ** ) &xNetworkContext.pcServerRootCAPem,
-                                                   &ulBufferLen );
-
-    if( xEspErrRet == ESP_OK )
-    {
-        #if CONFIG_GRI_OUTPUT_CERTS_KEYS
-            ESP_LOGI( TAG, "\nCA Cert: \nLength: %d\n%s",
-                      strlen( xNetworkContext.pcServerRootCAPem ),
-                      xNetworkContext.pcServerRootCAPem );
-        #endif /* CONFIG_GRI_OUTPUT_CERTS_KEYS */
-    }
-    else
-    {
-        ESP_LOGE( TAG, "Error in getting CA certificate. Error: %s",
-                  esp_err_to_name( xEspErrRet ) );
-
-        xRet = pdFAIL;
-    }
-
-    #if CONFIG_EXAMPLE_USE_DS_PERIPHERAL
-        /* If the digital signature peripheral is being used, get the digital
-         * signature peripheral context from esp_secure_crt_mgr and put into
-         * network context. */
-
-        xNetworkContext.ds_data = esp_secure_cert_get_ds_ctx();
-
-        if( xNetworkContext.ds_data == NULL )
-        {
-            ESP_LOGE( TAG, "Error in getting digital signature peripheral data." );
-            xRet = pdFAIL;
-        }
-    #else
-        #if CONFIG_ESP_SECURE_CERT_DS_PERIPHERAL
-        #error Reference Integration -> Use DS peripheral set to false \
-        but Component config -> Enable DS peripheral support set to    \
-        true.
-        #endif /* CONFIG_ESP_SECURE_CERT_DS_PERIPHERAL */
-
-        /* If the DS peripheral is not being used, get the device private key from
-         * esp_secure_crt_mgr and put into network context. */
-
-        xEspErrRet = esp_secure_cert_get_priv_key_addr( ( const void ** ) &xNetworkContext.pcClientKeyPem,
-                                                        &ulBufferLen );
-
-        if( xEspErrRet == ESP_OK )
-        {
-            #if CONFIG_GRI_OUTPUT_CERTS_KEYS
-                ESP_LOGI( TAG, "\nPrivate Key: \nLength: %d\n%s",
-                          strlen( xNetworkContext.pcClientKeyPem ),
-                          xNetworkContext.pcClientKeyPem );
-            #endif /* CONFIG_GRI_OUTPUT_CERTS_KEYS */
-        }
-        else
-        {
-            ESP_LOGE( TAG, "Error in getting private key. Error: %s",
-                      esp_err_to_name( xEspErrRet ) );
-
-            xRet = pdFAIL;
-        }
-    #endif /* CONFIG_EXAMPLE_USE_DS_PERIPHERAL */
+	#if CONFIG_GRI_OUTPUT_CERTS_KEYS
+		ESP_LOGI( TAG, "\nPrivate Key: \nLength: %d\n%s",
+					strlen( xNetworkContext.pcClientKeyPem ),
+					xNetworkContext.pcClientKeyPem );
+	#endif /* CONFIG_GRI_OUTPUT_CERTS_KEYS */
 
     xNetworkContext.pxTls = NULL;
     xNetworkContext.xTlsContextSemaphore = xSemaphoreCreateMutex();

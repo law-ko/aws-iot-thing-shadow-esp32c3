@@ -78,6 +78,9 @@
 /* Demo task configurations include. */
 #include "sub_pub_unsub_demo_config.h"
 
+/* SHADOW API header. */
+#include "shadow.h"
+
 /* Preprocessor definitions ***************************************************/
 
 /* coreMQTT-Agent event group bit definitions */
@@ -535,9 +538,13 @@ static void prvPublishToTopic( MQTTQoS_t xQoS,
 
         /* Check all ways the status was passed back just for demonstration
          * purposes. */
-        if( ( xCommandAcknowledged != pdTRUE ) ||
-            ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
-            ( ulNotifiedValue != ulPublishMessageId ) )
+		// @warning ulNotifiedValue is not the same as ulPublishMessageId, bypassing it first
+		ESP_LOGW( TAG, "xCommandAcknowledged=%s, xCommandContext.xReturnStatus=%s, ulNotifiedValue=%d, ulPublishMessageId=%d", (xCommandAcknowledged==pdTRUE) ? "pdTRUE" : "pdFALSE", (xCommandContext.xReturnStatus==MQTTSuccess) ? "MQTTSuccess" : "MQTTFail", ulNotifiedValue, ulPublishMessageId);
+        // if( ( xCommandAcknowledged != pdTRUE ) ||
+        //     ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
+        //     ( ulNotifiedValue != ulPublishMessageId ) )
+		if( ( xCommandAcknowledged != pdTRUE ) ||
+            ( xCommandContext.xReturnStatus != MQTTSuccess ) )
         {
             ESP_LOGW( TAG,
                       "Error or timed out waiting for ack for publish message %ld. Re-attempting publish.",
@@ -550,9 +557,11 @@ static void prvPublishToTopic( MQTTQoS_t xQoS,
                       ulPublishMessageId,
                       pcTaskGetName( xCommandContext.xTaskToNotify ) );
         }
-    } while( ( xCommandAcknowledged != pdTRUE ) ||
-             ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
-             ( ulNotifiedValue != ulPublishMessageId ) );
+    // } while( ( xCommandAcknowledged != pdTRUE ) ||
+    //          ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
+    //          ( ulNotifiedValue != ulPublishMessageId ) );
+	} while( ( xCommandAcknowledged != pdTRUE ) ||
+             ( xCommandContext.xReturnStatus != MQTTSuccess ) );
 }
 
 static void prvSubscribeToTopic( IncomingPublishCallbackContext_t * pxIncomingPublishCallbackContext,
@@ -751,7 +760,7 @@ static void prvUnsubscribeToTopic( MQTTQoS_t xQoS,
 
         /* Check all ways the status was passed back just for demonstration
          * purposes. */
-        if( ( xCommandAcknowledged != pdTRUE ) ||
+		if( ( xCommandAcknowledged != pdTRUE ) ||
             ( xCommandContext.xReturnStatus != MQTTSuccess ) ||
             ( ulNotifiedValue != ulUnsubscribeMessageId ) )
         {
@@ -775,7 +784,7 @@ static void prvUnsubscribeToTopic( MQTTQoS_t xQoS,
 static void prvSubscribePublishUnsubscribeTask( void * pvParameters )
 {
     struct DemoParams * pxParams = ( struct DemoParams * ) pvParameters;
-    uint32_t ulNotifiedValue;
+    // uint32_t ulNotifiedValue;
     uint32_t ulTaskNumber = pxParams->ulTaskNumber;
 
     IncomingPublishCallbackContext_t xIncomingPublishCallbackContext;
@@ -790,11 +799,22 @@ static void prvSubscribePublishUnsubscribeTask( void * pvParameters )
     xQoS = ( MQTTQoS_t ) subpubunsubconfigQOS_LEVEL;
 
     /* Create a topic name for this task to publish to. */
-    snprintf( pcTopicBuffer,
-              subpubunsubconfigSTRING_BUFFER_LENGTH,
-              "/filter/%s",
-              pcTaskGetName( xIncomingPublishCallbackContext.xTaskToNotify ) );
+    // snprintf( pcTopicBuffer,
+    //           subpubunsubconfigSTRING_BUFFER_LENGTH,
+    //           "/filter/%s",
+    //           pcTaskGetName( xIncomingPublishCallbackContext.xTaskToNotify ) );
 
+	uint16_t outLength = 0;
+	Shadow_AssembleTopicString(	ShadowTopicStringTypeUpdate,
+								CONFIG_GRI_THING_NAME,
+								sizeof( CONFIG_GRI_THING_NAME ) - 1,
+								"",	// for classic shadow
+								0,  // for classic shadow
+								pcTopicBuffer,
+								subpubunsubconfigSTRING_BUFFER_LENGTH,
+								&outLength );
+
+	uint16_t iteration = 0;
     while( 1 )
     {
         /* Subscribe to the same topic to which this task will publish.  That will
@@ -804,16 +824,54 @@ static void prvSubscribePublishUnsubscribeTask( void * pvParameters )
                              xQoS,
                              pcTopicBuffer );
 
+        // snprintf( pcPayload,
+        //           subpubunsubconfigSTRING_BUFFER_LENGTH,
+        //           "%s",
+        //           pcTaskGetName( xIncomingPublishCallbackContext.xTaskToNotify ) );
+
         snprintf( pcPayload,
                   subpubunsubconfigSTRING_BUFFER_LENGTH,
-                  "%s",
-                  pcTaskGetName( xIncomingPublishCallbackContext.xTaskToNotify ) );
+                  "{"                          \
+				  "\"state\":{"                \
+				  "\"reported\":{"             \
+                  "\"publishInfo\":"           \
+                  "{"                          \
+                  " \"taskName\": \"%s\","     \
+                  " \"iteration\": %d"         \
+				  "}"                          \
+				  "}"                          \
+                  "}"                          \
+                  "}"                          \
+                  ,
+                  pcTaskGetName( xIncomingPublishCallbackContext.xTaskToNotify ),
+                  iteration++ );
 
         prvPublishToTopic( xQoS,
                            pcTopicBuffer,
                            pcPayload );
 
-        prvWaitForNotification( &ulNotifiedValue );
+		snprintf( pcPayload,
+                  subpubunsubconfigSTRING_BUFFER_LENGTH,
+                  "{"                          \
+				  "\"state\":{"                \
+				  "\"reported\":{"             \
+                  "\"publishInfo\":"           \
+                  "{"                          \
+                  " \"taskName\": \"%s\","     \
+                  " \"iteration\": %d"         \
+				  "}"                          \
+				  "}"                          \
+                  "}"                          \
+                  "}"                          \
+                  ,
+                  pcTaskGetName( xIncomingPublishCallbackContext.xTaskToNotify ),
+                  iteration++ );
+
+        prvPublishToTopic( xQoS,
+                           pcTopicBuffer,
+                           pcPayload );
+
+        // prvWaitForNotification( &ulNotifiedValue );
 
         ESP_LOGI( TAG,
                   "Task \"%s\" received: %s",

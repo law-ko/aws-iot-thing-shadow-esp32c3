@@ -57,6 +57,7 @@ set(MAIN_REQUIRES
     ota-for-aws-iot-embedded-sdk
     FreeRTOS-Libraries-Integration-Tests
     unity
+	Device-Shadow-for-AWS-IoT-embedded-sdk
 )
 
 idf_component_register(
