@@ -70,6 +70,20 @@
     #include "qualification_wrapper_config.h"
 #endif /* CONFIG_GRI_RUN_QUALIFICATION_TEST */
 
+/* Mapping claim certificate from asm */
+#ifndef ROOT_CA_CERT_PATH
+    extern const char root_cert_auth_pem_start[]   asm("_binary_root_cert_auth_pem_start");
+    extern const char root_cert_auth_pem_end[]   asm("_binary_root_cert_auth_pem_end");
+#endif
+#ifndef CLIENT_CERT_PATH
+    extern const char client_cert_pem_start[] asm("_binary_client_crt_start");
+    extern const char client_cert_pem_end[] asm("_binary_client_crt_end");
+#endif
+#ifndef CLIENT_PRIVATE_KEY_PATH
+    extern const char client_key_pem_start[] asm("_binary_client_key_start");
+    extern const char client_key_pem_end[] asm("_binary_client_key_end");
+#endif
+
 /* Global variables ***********************************************************/
 
 /**
@@ -123,7 +137,7 @@ static BaseType_t prvInitializeNetworkContext( void )
     uint32_t ulBufferLen;
 
     /* This is used to store the error return of ESP-IDF functions. */
-    esp_err_t xEspErrRet;
+    esp_err_t xEspErrRet = ESP_OK;
 
     /* Verify that the MQTT endpoint and thing name have been configured by the
      * user. */
@@ -148,10 +162,14 @@ static BaseType_t prvInitializeNetworkContext( void )
     xNetworkContext.pcHostname = CONFIG_GRI_MQTT_ENDPOINT;
     xNetworkContext.xPort = CONFIG_GRI_MQTT_PORT;
 
-    /* Get the device certificate from esp_secure_crt_mgr and put into network
-     * context. */
-    xEspErrRet = esp_secure_cert_get_dev_cert_addr( ( const void ** ) &xNetworkContext.pcClientCertPem,
-                                                    &ulBufferLen );
+    // /* Get the device certificate from esp_secure_crt_mgr and put into network
+    //  * context. */
+    // xEspErrRet = esp_secure_cert_get_dev_cert_addr( ( const void ** ) &xNetworkContext.pcClientCertPem,
+    //                                                 &ulBufferLen );
+
+	/* Get the device certificate from ASM under main/certs folder. */
+	xNetworkContext.pcClientCertPem = client_cert_pem_start;
+	xNetworkContext.pcClientKeyPem = client_key_pem_start;
 
     if( xEspErrRet == ESP_OK )
     {
